@@ -1,21 +1,34 @@
 import { MarketOrder, OrderStatus } from "../types";
 import { MockDexRouter } from "../dex/MockDexRouter";
 
-// ===== "DB" in memory =====
+// -------- In-memory store --------
 export const orders = new Map<string, MarketOrder>();
 
-// ===== WebSocket listeners =====
+// All events per order for replay
+type Event = { status: OrderStatus; payload?: any };
+const events = new Map<string, Event[]>();
+
+// WebSocket listeners (live)
 type Listener = (status: OrderStatus, payload?: any) => void;
 const listeners = new Map<string, Listener[]>();
 
+// Subscribe + immediate replay of previous events
 export function subscribeOrder(
   orderId: string,
   listener: Listener
 ): () => void {
+  // 1) replay history
+  const history = events.get(orderId) || [];
+  for (const ev of history) {
+    listener(ev.status, ev.payload);
+  }
+
+  // 2) subscribe for future
   const list = listeners.get(orderId) || [];
   list.push(listener);
   listeners.set(orderId, list);
 
+  // unsubscriber
   return () => {
     const arr = listeners.get(orderId) || [];
     listeners.set(
@@ -25,19 +38,30 @@ export function subscribeOrder(
   };
 }
 
+function recordEvent(orderId: string, status: OrderStatus, payload?: any) {
+  const list = events.get(orderId) || [];
+  list.push({ status, payload });
+  events.set(orderId, list);
+}
+
 function emit(orderId: string, status: OrderStatus, payload?: any) {
-  const subs = listeners.get(orderId) || [];
-  for (const fn of subs) {
-    fn(status, payload);
-  }
+  recordEvent(orderId, status, payload);
+
+  // update order object
   const order = orders.get(orderId);
   if (order) {
     order.status = status;
     orders.set(orderId, order);
   }
+
+  // notify live listeners
+  const subs = listeners.get(orderId) || [];
+  for (const fn of subs) {
+    fn(status, payload);
+  }
 }
 
-// ===== Queue implementation =====
+// -------- Simple in-memory queue --------
 const queue: MarketOrder[] = [];
 let active = 0;
 const MAX_CONCURRENT = 10;
@@ -45,22 +69,20 @@ const MAX_ATTEMPTS = 3;
 const router = new MockDexRouter();
 
 export function enqueueOrder(order: MarketOrder) {
-  console.log("QUEUE: order received to enqueue:", order.id);
+  console.log("QUEUE: enqueue", order.id);
   queue.push(order);
   orders.set(order.id, order);
   processQueue();
 }
 
 function processQueue() {
-  console.log("QUEUE: processQueue called. Active:", active, "Queue length:", queue.length);
+  console.log("QUEUE: processQueue, active =", active, "len =", queue.length);
   while (active < MAX_CONCURRENT && queue.length > 0) {
     const order = queue.shift()!;
-    console.log("QUEUE: processing order", order.id);
     active++;
+    console.log("QUEUE: start order", order.id);
     processOrder(order)
-      .catch(() => {
-        // errors handled inside processOrder
-      })
+      .catch((err) => console.error("QUEUE: order error", err))
       .finally(() => {
         active--;
         processQueue();
@@ -84,7 +106,6 @@ async function processOrder(order: MarketOrder): Promise<void> {
     emit(orderId, "building", { dex: best.dex, price: best.price });
 
     emit(orderId, "submitted");
-
     const result = await router.executeSwap(best.dex, best.price);
 
     emit(orderId, "confirmed", {
@@ -96,7 +117,7 @@ async function processOrder(order: MarketOrder): Promise<void> {
     console.error("Order failed", orderId, err);
     if (order.attempts < MAX_ATTEMPTS) {
       const nextAttempt = order.attempts + 1;
-      const delay = 1000 * Math.pow(2, order.attempts); // 1s, 2s, 4s...
+      const delay = 1000 * Math.pow(2, order.attempts); // 1s, 2s, 4s
 
       const retry: MarketOrder = {
         ...order,
@@ -108,9 +129,7 @@ async function processOrder(order: MarketOrder): Promise<void> {
         processQueue();
       }, delay);
     } else {
-      emit(orderId, "failed", {
-        error: "Max retry attempts reached"
-      });
+      emit(orderId, "failed", { error: "Max retry attempts reached" });
     }
   }
 }
